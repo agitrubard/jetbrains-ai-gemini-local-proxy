@@ -1,0 +1,17 @@
+services:
+  jetbrains-ai-gemini-local-proxy:
+    build: .
+    container_name: jetbrains-ai-gemini-local-proxy
+    ports:
+      - "5003:5003"
+    environment:
+      # ============================================================
+      #  PASTE YOUR GEMINI API KEY BETWEEN THE QUOTES BELOW
+      # ============================================================
+      GEMINI_API_KEY: "PASTE_YOUR_GEMINI_API_KEY_HERE"
+
+      # Optional overrides (defaults are fine for the JetBrains setup):
+      PROXY_PORT: "5003"
+      DEFAULT_MODEL: "gemini-2.5-flash"
+      # GEMINI_BASE_URL: "https://generativelanguage.googleapis.com/v1beta/openai"
+    restart: unless-stopped
