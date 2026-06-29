@@ -24,8 +24,16 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
+
+# Configure the root logger from LOG_LEVEL (default INFO) so the app's own
+# log.info / log.debug calls are actually emitted. Running under uvicorn does
+# NOT configure this named logger, so we must do it here at import time.
+#   LOG_LEVEL=DEBUG  -> raw bodies, sanitised payloads, per-chunk stream dumps.
+#   LOG_LEVEL=INFO   -> one line per request + timing (default).
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
+    level=LOG_LEVEL,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 log = logging.getLogger("jetbrains-ai-gemini-local-proxy")
 
@@ -114,7 +122,10 @@ async def lifespan(app: FastAPI):
     app.state.client = httpx.AsyncClient(timeout=timeout, limits=limits)
     if not GEMINI_API_KEY:
         log.warning("GEMINI_API_KEY is empty - set it in docker-compose.yml")
-    log.info("Proxy ready -> %s (port %s)", GEMINI_BASE_URL, PROXY_PORT)
+    log.info(
+        "Proxy ready -> %s (port=%s log_level=%s key_loaded=%s)",
+        GEMINI_BASE_URL, PROXY_PORT, LOG_LEVEL, bool(GEMINI_API_KEY),
+    )
     yield
     await app.state.client.aclose()
 
@@ -175,14 +186,40 @@ def _safe_json(r: httpx.Response):
 @app.post("/chat/completions")
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
+    body = await request.body()
+    # Identify the caller (Authorization redacted) so empty/probe requests can
+    # be told apart from real prompts.
+    hdrs = {
+        k: v for k, v in request.headers.items()
+        if k.lower() != "authorization"
+    }
+    log.debug("incoming %s %s headers=%s", request.method, request.url.path, hdrs)
+    log.debug("raw body: %s", body)
     try:
-        raw = await request.json()
+        if not body:
+            # content-length > 0 with an empty body means the server dropped it
+            # (historically: uvicorn's httptools parser swallowing the body on a
+            # ktor 'Upgrade: h2c' request -- fixed by running uvicorn --http h11).
+            log.error(
+                "empty request body (ua=%r content-length=%r upgrade=%r) -- if "
+                "content-length>0 the HTTP layer dropped the body; check the "
+                "uvicorn --http parser / Upgrade handling",
+                request.headers.get("user-agent"),
+                request.headers.get("content-length"),
+                request.headers.get("upgrade"),
+            )
+            return JSONResponse(
+                {"error": {"message": "empty request body"}}, status_code=400
+            )
+        raw = json.loads(body)
     except Exception:
+        log.error("invalid JSON body: %s", body.decode("utf-8", "replace"))
         return JSONResponse(
             {"error": {"message": "invalid JSON body"}}, status_code=400
         )
 
     payload = sanitize_payload(raw if isinstance(raw, dict) else {})
+    log.debug("payload: %s", payload)
     url = f"{GEMINI_BASE_URL}/chat/completions"
     client: httpx.AsyncClient = app.state.client
 
@@ -196,27 +233,41 @@ async def chat_completions(request: Request):
 
     # ---- Non-streaming -------------------------------------------------- #
     if not payload["stream"]:
+        t0 = time.perf_counter()
         try:
             r = await client.post(url, json=payload, headers=_auth_headers())
         except httpx.HTTPError as e:
+            log.error("upstream error: %s", e)
             return JSONResponse(
                 {"error": {"message": f"upstream error: {e}"}}, status_code=502
             )
-        return JSONResponse(content=_safe_json(r), status_code=r.status_code)
+        response_json = _safe_json(r)
+        log.info(
+            "non-stream done status=%s in %.2fs", r.status_code,
+            time.perf_counter() - t0,
+        )
+        if r.status_code >= 400:
+            log.error("upstream %s body: %s", r.status_code, r.text)
+        log.debug("non-stream response: %s", response_json)
+        return JSONResponse(content=response_json, status_code=r.status_code)
 
     # ---- Streaming: zero-buffer SSE pass-through ------------------------ #
     async def event_stream():
         t0 = time.perf_counter()
         first = True
+        total_bytes = 0
+        chunks = 0
         try:
             async with client.stream(
                 "POST", url, json=payload, headers=_auth_headers()
             ) as resp:
                 if resp.status_code != 200:
                     body = await resp.aread()
+                    text = body.decode("utf-8", "replace")
+                    log.error("stream upstream %s body: %s", resp.status_code, text)
                     err = {
                         "error": {
-                            "message": body.decode("utf-8", "replace"),
+                            "message": text,
                             "code": resp.status_code,
                         }
                     }
@@ -232,8 +283,16 @@ async def chat_completions(request: Request):
                                 "first byte in %.2fs", time.perf_counter() - t0
                             )
                             first = False
+                        total_bytes += len(chunk)
+                        chunks += 1
+                        log.debug("stream chunk: %s", chunk)
                         yield chunk
+            log.info(
+                "stream done: %d chunks, %d bytes in %.2fs",
+                chunks, total_bytes, time.perf_counter() - t0,
+            )
         except httpx.HTTPError as e:
+            log.error("stream error after %d chunks: %s", chunks, e)
             err = {"error": {"message": str(e)}}
             yield f"data: {json.dumps(err)}\n\n".encode()
             yield b"data: [DONE]\n\n"
@@ -263,5 +322,6 @@ if __name__ == "__main__":
     import uvicorn
 
     uvicorn.run(
-        "main:app", host="0.0.0.0", port=PROXY_PORT, log_level="info"
+        "main:app", host="0.0.0.0", port=PROXY_PORT, log_level=LOG_LEVEL.lower()
     )
+

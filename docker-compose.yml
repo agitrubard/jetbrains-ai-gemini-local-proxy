@@ -9,4 +9,5 @@ services:
     environment:
       PROXY_PORT: "5003"
       DEFAULT_MODEL: "gemini-2.5-flash"
+      LOG_LEVEL: "DEBUG"
     restart: always
